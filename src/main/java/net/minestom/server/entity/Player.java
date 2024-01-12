@@ -1,12 +1,16 @@
 package net.minestom.server.entity;
 
-import it.unimi.dsi.fastutil.longs.LongArrayList;
+import it.unimi.dsi.fastutil.longs.LongArrayPriorityQueue;
+import it.unimi.dsi.fastutil.longs.LongPriorityQueue;
 import net.kyori.adventure.audience.MessageType;
 import net.kyori.adventure.bossbar.BossBar;
 import net.kyori.adventure.identity.Identified;
 import net.kyori.adventure.identity.Identity;
 import net.kyori.adventure.inventory.Book;
 import net.kyori.adventure.pointer.Pointers;
+import net.kyori.adventure.resource.ResourcePackCallback;
+import net.kyori.adventure.resource.ResourcePackRequest;
+import net.kyori.adventure.resource.ResourcePackStatus;
 import net.kyori.adventure.sound.Sound;
 import net.kyori.adventure.sound.SoundStop;
 import net.kyori.adventure.text.Component;
@@ -65,7 +69,6 @@ import net.minestom.server.network.player.PlayerConnection;
 import net.minestom.server.network.player.PlayerSocketConnection;
 import net.minestom.server.recipe.Recipe;
 import net.minestom.server.recipe.RecipeManager;
-import net.minestom.server.resourcepack.ResourcePack;
 import net.minestom.server.scoreboard.BelowNameTag;
 import net.minestom.server.scoreboard.Team;
 import net.minestom.server.snapshot.EntitySnapshot;
@@ -74,9 +77,9 @@ import net.minestom.server.snapshot.SnapshotImpl;
 import net.minestom.server.snapshot.SnapshotUpdater;
 import net.minestom.server.statistic.PlayerStatistic;
 import net.minestom.server.timer.Scheduler;
-import net.minestom.server.timer.TaskSchedule;
 import net.minestom.server.utils.MathUtils;
 import net.minestom.server.utils.PacketUtils;
+import net.minestom.server.utils.PropertyUtils;
 import net.minestom.server.utils.async.AsyncUtils;
 import net.minestom.server.utils.chunk.ChunkUpdateLimitChecker;
 import net.minestom.server.utils.chunk.ChunkUtils;
@@ -93,6 +96,8 @@ import org.jctools.queues.MpscUnboundedXaddArrayQueue;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -100,8 +105,8 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
-import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 
 /**
@@ -111,9 +116,15 @@ import java.util.function.UnaryOperator;
  * You can easily create your own implementation of this and use it with {@link ConnectionManager#setPlayerProvider(PlayerProvider)}.
  */
 public class Player extends LivingEntity implements CommandSender, Localizable, HoverEventSource<ShowEntity>, Identified, NamedAndIdentified {
+    private static final Logger logger = LoggerFactory.getLogger(Player.class);
+
     private static final Component REMOVE_MESSAGE = Component.text("You have been removed from the server without reason.", NamedTextColor.RED);
     private static final int PACKET_PER_TICK = Integer.getInteger("minestom.packet-per-tick", 20);
     private static final int PACKET_QUEUE_SIZE = Integer.getInteger("minestom.packet-queue-size", 1000);
+
+    private static final float MIN_CHUNKS_PER_TICK = PropertyUtils.getFloat("minestom.chunk-queue.min-per-tick", 0.01f);
+    private static final float MAX_CHUNKS_PER_TICK = PropertyUtils.getFloat("minestom.chunk-queue.max-per-tick", 64.0f);
+    private static final float CHUNKS_PER_TICK_MULTIPLIER = PropertyUtils.getFloat("minestom.chunk-queue.multiplier", 1f);
 
     public static final boolean EXPERIMENT_PERFORM_POSE_UPDATES = Boolean.getBoolean("minestom.experiment.pose-updates");
 
@@ -132,21 +143,30 @@ public class Player extends LivingEntity implements CommandSender, Localizable, 
     private DimensionType dimensionType;
     private GameMode gameMode;
     private DeathLocation deathLocation;
+
     /**
      * Keeps track of what chunks are sent to the client, this defines the center of the loaded area
      * in the range of {@link MinecraftServer#getChunkViewDistance()}
      */
     private Vec chunksLoadedByClient = Vec.ZERO;
+    private final ReentrantLock chunkQueueLock = new ReentrantLock();
+    private final LongPriorityQueue chunkQueue = new LongArrayPriorityQueue(this::compareChunkDistance);
+    private float targetChunksPerTick = 9f; // Always send 9 chunks immediately
+    private float pendingChunkCount = 0f; // Number of chunks to send on the current tick (ie 0.5 means we cannot send a chunk yet, 1.5 would send a single chunk with a 0.5 remainder)
+    private int maxChunkBatchLead = 1; // Maximum number of batches to send before waiting for a reply
+    private int chunkBatchLead = 0; // Number of batches sent without a reply
+
     final IntegerBiConsumer chunkAdder = (chunkX, chunkZ) -> {
         // Load new chunks
         this.instance.loadOptionalChunk(chunkX, chunkZ).thenAccept(chunk -> {
+            if (chunk == null) return;
+            chunkQueueLock.lock();
             try {
-                if (chunk != null) {
-                    chunk.sendChunk(this);
-                    EventDispatcher.call(new PlayerChunkLoadEvent(this, chunkX, chunkZ));
-                }
+                chunkQueue.enqueue(ChunkUtils.getChunkIndex(chunkX, chunkZ));
             } catch (Exception e) {
                 MinecraftServer.getExceptionManager().handleException(e);
+            } finally {
+                chunkQueueLock.unlock();
             }
         });
     };
@@ -159,7 +179,8 @@ public class Player extends LivingEntity implements CommandSender, Localizable, 
     private final AtomicInteger teleportId = new AtomicInteger();
     private int receivedTeleportId;
 
-    private record PacketInState(ConnectionState state, ClientPacket packet) {}
+    private record PacketInState(ConnectionState state, ClientPacket packet) {
+    }
 
     private final MessagePassingQueue<PacketInState> packets = new MpscUnboundedXaddArrayQueue<>(32);
     private final boolean levelFlat;
@@ -213,6 +234,11 @@ public class Player extends LivingEntity implements CommandSender, Localizable, 
     // Adventure
     private Identity identity;
     private final Pointers pointers;
+
+    // Resource packs
+    private final Map<UUID, ResourcePackCallback> resourcePackCallbacks = new HashMap<>();
+    // The future is non-null when a resource pack is in-flight, and completed when all statuses have been received.
+    private CompletableFuture<Void> resourcePackFuture = null;
 
     public Player(@NotNull UUID uuid, @NotNull String username, @NotNull PlayerConnection playerConnection) {
         super(EntityType.PLAYER, uuid);
@@ -283,6 +309,8 @@ public class Player extends LivingEntity implements CommandSender, Localizable, 
 
         sendPacket(new SpawnPositionPacket(respawnPoint, 0));
 
+        // Reenable metadata notifications as we leave the configuration state
+        metadata.setNotifyAboutChanges(true);
         sendPacket(getMetadataPacket());
 
         // Add player to list with spawning skin
@@ -387,6 +415,9 @@ public class Player extends LivingEntity implements CommandSender, Localizable, 
         interpretPacketQueue();
         // It is possible to be removed during packet processing, if thats the case exit immediately.
         if (isRemoved()) return;
+
+        // Send any available queued chunks
+        sendPendingChunks();
 
         super.update(time); // Super update (item pickup/fire management)
 
@@ -509,16 +540,7 @@ public class Player extends LivingEntity implements CommandSender, Localizable, 
         Pos respawnPosition = respawnEvent.getRespawnPosition();
 
         // The client unloads chunks when respawning, so resend all chunks next to spawn
-        ChunkUtils.forChunksInRange(respawnPosition, Math.min(MinecraftServer.getChunkViewDistance(), settings.getViewDistance()), (chunkX, chunkZ) ->
-                this.instance.loadOptionalChunk(chunkX, chunkZ).thenAccept(chunk -> {
-                    try {
-                        if (chunk != null) {
-                            chunk.sendChunk(this);
-                        }
-                    } catch (Exception e) {
-                        MinecraftServer.getExceptionManager().handleException(e);
-                    }
-                }));
+        ChunkUtils.forChunksInRange(respawnPosition, settings.getEffectiveViewDistance(), chunkAdder);
         chunksLoadedByClient = new Vec(respawnPosition.chunkX(), respawnPosition.chunkZ());
         // Client also needs all entities resent to them, since those are unloaded as well
         this.instance.getEntityTracker().nearbyEntitiesByChunkRange(respawnPosition, Math.min(MinecraftServer.getChunkViewDistance(), settings.getViewDistance()),
@@ -722,26 +744,8 @@ public class Player extends LivingEntity implements CommandSender, Localizable, 
             chunkUpdateLimitChecker.addToHistory(getChunk());
             sendPacket(new UpdateViewPositionPacket(chunkX, chunkZ));
 
-            if (ChunkUtils.USE_NEW_CHUNK_SENDING) {
-                // FIXME: Improve this queueing. It is pretty scuffed
-                var chunkQueue = new LongArrayList();
-                ChunkUtils.forChunksInRange(spawnPosition, MinecraftServer.getChunkViewDistance(),
-                        (x, z) -> chunkQueue.add(ChunkUtils.getChunkIndex(x, z)));
-                var iter = chunkQueue.iterator();
-                Supplier<TaskSchedule> taskRunnable = () -> {
-                    for (int i = 0; i < ChunkUtils.NEW_CHUNK_COUNT_PER_INTERVAL; i++) {
-                        if (!iter.hasNext()) return TaskSchedule.stop();
-
-                        var next = iter.nextLong();
-                        chunkAdder.accept(ChunkUtils.getChunkCoordX(next), ChunkUtils.getChunkCoordZ(next));
-                    }
-
-                    return TaskSchedule.tick(ChunkUtils.NEW_CHUNK_SEND_INTERVAL);
-                };
-                scheduler().submitTask(taskRunnable);
-            } else {
-                ChunkUtils.forChunksInRange(spawnPosition, MinecraftServer.getChunkViewDistance(), chunkAdder);
-            }
+            // Load the nearby chunks and queue them to be sent to them
+            ChunkUtils.forChunksInRange(spawnPosition, MinecraftServer.getChunkViewDistance(), chunkAdder);
         }
 
         synchronizePosition(true); // So the player doesn't get stuck
@@ -761,6 +765,63 @@ public class Player extends LivingEntity implements CommandSender, Localizable, 
         }
 
         EventDispatcher.call(new PlayerSpawnEvent(this, instance, firstSpawn));
+    }
+
+    @ApiStatus.Internal
+    public void onChunkBatchReceived(float newTargetChunksPerTick) {
+//        logger.debug("chunk batch received player={} chunks/tick={} lead={}", username, newTargetChunksPerTick, chunkBatchLead);
+        chunkBatchLead -= 1;
+        targetChunksPerTick = Float.isNaN(newTargetChunksPerTick) ? MIN_CHUNKS_PER_TICK : MathUtils.clamp(
+                newTargetChunksPerTick * CHUNKS_PER_TICK_MULTIPLIER, MIN_CHUNKS_PER_TICK, MAX_CHUNKS_PER_TICK);
+
+        // Beyond the first batch we can preemptively send up to 10 (matching mojang server)
+        if (maxChunkBatchLead == 1) maxChunkBatchLead = 10;
+    }
+
+    /**
+     * Queues the given chunk to be sent to the player.
+     * @param chunk The chunk to send
+     */
+    public void sendChunk(@NotNull Chunk chunk) {
+        if (!chunk.isLoaded()) return;
+        chunkQueueLock.lock();
+        try {
+            chunkQueue.enqueue(ChunkUtils.getChunkIndex(chunk.getChunkX(), chunk.getChunkZ()));
+        } finally {
+            chunkQueueLock.unlock();
+        }
+    }
+
+    private void sendPendingChunks() {
+        // If we have nothing to send or have sent the max # of batches without reply, do nothing
+        if (chunkQueue.isEmpty() || chunkBatchLead >= maxChunkBatchLead) return;
+
+        // Increment the pending chunk count by the target chunks per tick
+        pendingChunkCount = Math.min(pendingChunkCount + targetChunksPerTick, MAX_CHUNKS_PER_TICK);
+        if (pendingChunkCount < 1) return; // Cant send anything
+
+        chunkQueueLock.lock();
+        try {
+            int batchSize = 0;
+            sendPacket(new ChunkBatchStartPacket());
+            while (!chunkQueue.isEmpty() && pendingChunkCount >= 1f) {
+                long chunkIndex = chunkQueue.dequeueLong();
+                int chunkX = ChunkUtils.getChunkCoordX(chunkIndex), chunkZ = ChunkUtils.getChunkCoordZ(chunkIndex);
+                var chunk = instance.getChunk(chunkX, chunkZ);
+                if (chunk == null || !chunk.isLoaded()) continue;
+
+                sendPacket(chunk.getFullDataPacket());
+                EventDispatcher.call(new PlayerChunkLoadEvent(this, chunkX, chunkZ));
+
+                pendingChunkCount -= 1f;
+                batchSize += 1;
+            }
+            sendPacket(new ChunkBatchFinishedPacket(batchSize));
+            chunkBatchLead += 1;
+//            logger.debug("chunk batch sent player={} chunks={} lead={}", username, batchSize, chunkBatchLead);
+        } finally {
+            chunkQueueLock.unlock();
+        }
     }
 
     @Override
@@ -801,6 +862,7 @@ public class Player extends LivingEntity implements CommandSender, Localizable, 
 
     /**
      * Returns true if the player can fit at the current position with the given {@link net.minestom.server.entity.Entity.Pose}, false otherwise.
+     *
      * @param pose The pose to check
      */
     private boolean canFitWithBoundingBox(@NotNull Pose pose) {
@@ -1215,13 +1277,56 @@ public class Player extends LivingEntity implements CommandSender, Localizable, 
         return !itemDropEvent.isCancelled();
     }
 
+    @Override
+    public void sendResourcePacks(@NotNull ResourcePackRequest request) {
+        if (request.replace()) clearResourcePacks();
+
+        for (var pack : request.packs()) {
+            sendPacket(new ResourcePackPushPacket(pack, request.required(), request.prompt()));
+            resourcePackCallbacks.put(pack.id(), request.callback());
+            if (resourcePackFuture == null) {
+                resourcePackFuture = new CompletableFuture<>();
+            }
+        }
+    }
+
+    @Override
+    public void removeResourcePacks(@NotNull UUID id, @NotNull UUID @NotNull ... others) {
+        sendPacket(new ResourcePackPopPacket(id));
+        for (var other : others) {
+            sendPacket(new ResourcePackPopPacket(other));
+        }
+    }
+
+    @Override
+    public void clearResourcePacks() {
+        sendPacket(new ResourcePackPopPacket((UUID) null));
+    }
+
     /**
-     * Sets the player resource pack.
-     *
-     * @param resourcePack the resource pack
+     * If there are resource packs in-flight, a future is returned which will be completed when
+     * all resource packs have been responded to by the client. Otherwise null is returned.
      */
-    public void setResourcePack(@NotNull ResourcePack resourcePack) {
-        sendPacket(new ResourcePackPushPacket(resourcePack));
+    @ApiStatus.Internal
+    public @Nullable CompletableFuture<Void> getResourcePackFuture() {
+        return resourcePackFuture;
+    }
+
+    @ApiStatus.Internal
+    public void onResourcePackStatus(@NotNull UUID id, @NotNull ResourcePackStatus status) {
+        var callback = resourcePackCallbacks.get(id);
+        if (callback == null) return;
+
+        callback.packEventReceived(id, status, this);
+        if (!status.intermediate()) {
+            // Remove the callback and finish the future if relevant
+            resourcePackCallbacks.remove(id);
+
+            if (resourcePackCallbacks.isEmpty() && resourcePackFuture != null) {
+                resourcePackFuture.complete(null);
+                resourcePackFuture = null;
+            }
+        }
     }
 
     /**
@@ -2079,7 +2184,7 @@ public class Player extends LivingEntity implements CommandSender, Localizable, 
 
     @Override
     public @NotNull HoverEvent<ShowEntity> asHoverEvent(@NotNull UnaryOperator<ShowEntity> op) {
-        return HoverEvent.showEntity(ShowEntity.of(EntityType.PLAYER, this.uuid, this.displayName));
+        return HoverEvent.showEntity(ShowEntity.showEntity(EntityType.PLAYER, this.uuid, this.displayName));
     }
 
     /**
@@ -2314,6 +2419,10 @@ public class Player extends LivingEntity implements CommandSender, Localizable, 
             return viewDistance;
         }
 
+        public int getEffectiveViewDistance() {
+            return Math.min(getViewDistance(), MinecraftServer.getChunkViewDistance());
+        }
+
         /**
          * Gets the messages this player wants to receive.
          *
@@ -2385,6 +2494,16 @@ public class Player extends LivingEntity implements CommandSender, Localizable, 
             if (isInPlayState) metadata.setNotifyAboutChanges(true);
         }
 
+    }
+
+    private int compareChunkDistance(long chunkIndexA, long chunkIndexB) {
+        int chunkAX = ChunkUtils.getChunkCoordX(chunkIndexA);
+        int chunkAZ = ChunkUtils.getChunkCoordZ(chunkIndexA);
+        int chunkBX = ChunkUtils.getChunkCoordX(chunkIndexB);
+        int chunkBZ = ChunkUtils.getChunkCoordZ(chunkIndexB);
+        int chunkDistanceA = Math.abs(chunkAX - chunksLoadedByClient.blockX()) + Math.abs(chunkAZ - chunksLoadedByClient.blockZ());
+        int chunkDistanceB = Math.abs(chunkBX - chunksLoadedByClient.blockX()) + Math.abs(chunkBZ - chunksLoadedByClient.blockZ());
+        return Integer.compare(chunkDistanceA, chunkDistanceB);
     }
 
 }

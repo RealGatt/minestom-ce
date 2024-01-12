@@ -1,7 +1,12 @@
 package net.minestom.demo;
 
+import net.kyori.adventure.resource.ResourcePackInfo;
+import net.kyori.adventure.resource.ResourcePackRequest;
 import net.kyori.adventure.text.Component;
 import net.minestom.server.MinecraftServer;
+import net.minestom.server.advancements.FrameType;
+import net.minestom.server.advancements.notifications.Notification;
+import net.minestom.server.advancements.notifications.NotificationCenter;
 import net.minestom.server.adventure.MinestomAdventure;
 import net.minestom.server.adventure.audience.Audiences;
 import net.minestom.server.coordinate.Pos;
@@ -18,7 +23,10 @@ import net.minestom.server.event.item.ItemDropEvent;
 import net.minestom.server.event.item.PickupItemEvent;
 import net.minestom.server.event.player.*;
 import net.minestom.server.event.server.ServerTickMonitorEvent;
-import net.minestom.server.instance.*;
+import net.minestom.server.instance.Instance;
+import net.minestom.server.instance.InstanceContainer;
+import net.minestom.server.instance.InstanceManager;
+import net.minestom.server.instance.LightingChunk;
 import net.minestom.server.instance.block.Block;
 import net.minestom.server.inventory.Inventory;
 import net.minestom.server.inventory.InventoryType;
@@ -32,8 +40,11 @@ import net.minestom.server.utils.NamespaceID;
 import net.minestom.server.utils.time.TimeUnit;
 import net.minestom.server.world.DimensionType;
 
+import java.net.URI;
 import java.time.Duration;
-import java.util.*;
+import java.util.Random;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -107,6 +118,15 @@ public class PlayerInit {
                         })
                         .build();
                 player.getInventory().addItemStack(bundle);
+
+                if (event.isFirstSpawn()) {
+                    Notification notification = new Notification(
+                            Component.text("Welcome!"),
+                            FrameType.TASK,
+                            Material.IRON_SWORD
+                    );
+                    NotificationCenter.send(notification, event.getPlayer());
+                }
             })
             .addListener(PlayerPacketOutEvent.class, event -> {
                 //System.out.println("out " + event.getPacket().getClass().getSimpleName());
@@ -122,10 +142,10 @@ public class PlayerInit {
 
                 event.getPlayer().sendMessage("MESSAGE " + ThreadLocalRandom.current().nextDouble());
 
-                if ("false".equals(block.getProperty("waterlogged")) && itemStack.material().equals(Material.WATER_BUCKET)) {
+                if ("false" .equals(block.getProperty("waterlogged")) && itemStack.material().equals(Material.WATER_BUCKET)) {
                     block = block.withProperty("waterlogged", "true");
                     System.out.println("SET WATERLOGGER");
-                } else if ("true".equals(block.getProperty("waterlogged")) && itemStack.material().equals(Material.BUCKET)) {
+                } else if ("true" .equals(block.getProperty("waterlogged")) && itemStack.material().equals(Material.BUCKET)) {
                     block = block.withProperty("waterlogged", "false");
                     System.out.println("SET NOT WATERLOGGED");
                 } else return;
